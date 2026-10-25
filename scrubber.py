@@ -241,26 +241,26 @@ for filename in inbox_files:
                 shutil.copy2(track_path, destination_file)
                 print(f"Copied: {destination_file}")
 
-             # Add covers and extra files to the artist backup ZIP
-            if backup_artist and backup_album:
-                for cover_path in cover_files:
-                    cover_name = os.path.basename(cover_path)
-                    add_to_artist_backup(
-                        cover_path,
-                        backup_artist,
-                        backup_album,
-                        cover_name,
-                    )
+        # Add covers and extra files to the artist backup ZIP
+        if backup_artist and backup_album:
+            for cover_path in cover_files:
+                cover_name = os.path.basename(cover_path)
+                add_to_artist_backup(
+                    cover_path,
+                    backup_artist,
+                    backup_album,
+                    cover_name,
+                )
 
-                for extra_path in unsupported_files:
-                    relative_path = os.path.relpath(extra_path, temp_folder)
-                    extra_name = "Extras/" + relative_path.replace(os.sep, "/")
-                    add_to_artist_backup(
-                        extra_path,
-                        backup_artist,
-                        backup_album,
-                        extra_name,
-                            )
+            for extra_path in unsupported_files:
+                relative_path = os.path.relpath(extra_path, temp_folder)
+                extra_name = "Extras/" + relative_path.replace(os.sep, "/")
+                add_to_artist_backup(
+                    extra_path,
+                    backup_artist,
+                    backup_album,
+                    extra_name,
+                        )
 
     #Inbox cleaning
     os.remove(file_path)
