@@ -1,4 +1,4 @@
-Backups/
+.backups/
 .venv/
 Inbox/
 __pycache__/

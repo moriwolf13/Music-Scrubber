@@ -7,7 +7,7 @@ import ntpath
 
 #Static variables
 inbox_folder_name: str = "Inbox"
-backup_folder_name: str = "Backups"
+backup_folder_name: str = ".backups"
 library_folder_name: str = "Music Library"
 album_art_types: tuple = (".jpg", ".png")
 music_file_types: tuple = (".mp3", ".flac")
