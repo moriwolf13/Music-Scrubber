@@ -38,7 +38,7 @@ Music/
 ├── Music Library/
 └── Scrubber/
     ├── scrubber.py
-    ├── requirements.txt
+    ├── .requirements.txt
     ├── Inbox/
     ├── .backups/
     └── .venv/
