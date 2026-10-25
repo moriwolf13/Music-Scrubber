@@ -18,7 +18,7 @@ The artist archives are organized copies of the music files and extras. They are
 ## Requirements
 
 - Python 3
-- Mutagen, listed in `requirements.txt`
+- Mutagen, listed in `.requirements.txt`
 
 ## Installation
 
@@ -61,9 +61,9 @@ Music/
 
 Other files inside a ZIP are added to the artist archive under the album’s `Extras/` folder and are not copied to Music Library. Unsupported files placed directly in Inbox are left there.
 
-## Source file cleanup
+## Inbox cleanup
 
-The script removes an Inbox file after successful processing only if the `os.remove(file_path)` line in the Inbox-cleanup section is enabled. If that line is commented out, the source remains in Inbox.
+After a supported ZIP, MP3, or FLAC file is processed successfully, the script removes the original from `Inbox`. Unsupported Inbox files are left untouched. If processing fails, cleanup is not reached, so that source file remains in `Inbox`.
 
 ## Git
 
