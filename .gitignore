@@ -1,0 +1,5 @@
+Backups/
+.venv/
+Inbox/
+__pycache__/
+*.py[cod]
