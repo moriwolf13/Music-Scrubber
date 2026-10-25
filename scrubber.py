@@ -266,5 +266,5 @@ for filename in inbox_files:
     os.remove(file_path)
     print(f"{filename} processed and removed from Inbox")
 
-print("Inbox cleared!")
+print("Supported Inbox items processed!")
 print("Sorting complete!")
