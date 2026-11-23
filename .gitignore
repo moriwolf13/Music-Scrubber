@@ -1,5 +1,59 @@
-.backups/
-.venv/
+# Runtime music and archives
 Inbox/
+.staging/
+.staging-provenance/
+.backups/
+.review_artwork/
+
+# Local tools and Python environments
+.venv/
+.tools/
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Import, review and recovery state
+.needs_review.json
+.completed_reviews.json
+.verified_imports.json
+.retired_import_receipts.json
+.retired_reviews.json
+.mixie-import-first.json
+.mixie-ingest.lock
+.mixie_logs/
+
+# Local credentials and machine-specific configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+acoustid_key
+
+# Generated files and local exports
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.bak
+*.tmp
+.DS_Store
+
+# Legacy runtime artifacts
+*.log
+
+# Superseded engineering handoff reports (kept locally)
+docs/AUTO_INGEST_STABILIZATION_20261121.md
+docs/CLEANUP_INVENTORY.md
+docs/PENDING_FIVE_RETRY.md
+docs/PROJECT_LAYOUT_CURRENT.md
+docs/SHARED_ORIGINALS_STORAGE.md
+
+# Local diagnostic transcripts
+docs/stress_test.txt

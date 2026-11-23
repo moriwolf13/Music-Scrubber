@@ -1,1 +1,4 @@
 mutagen
+Pillow>=9.1
+# The bounded transport adapter is tested against this client version.
+musicbrainzngs==0.7.1
