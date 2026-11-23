@@ -8,208 +8,503 @@ import constants
 import hashlib
 from pathlib import Path
 import json
+import uuid
+import fcntl
+from contextlib import contextmanager
 
 #Set safety limits for ZIP archives
 MAX_ZIP_UNCOMPRESSED_BYTES = 10 * 1024**3  # 10 GiB
 MAX_ZIP_MEMBERS = 10_000
 
 #File routing
-script_folder = os.path.dirname(os.path.abspath(__file__))
+script_folder = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 drive_folder = os.path.dirname(script_folder)
 inbox_folder = os.path.join(script_folder, constants.inbox_folder_name)
 music_library_folder = os.path.join(drive_folder, constants.library_folder_name)
 staging_folder = os.path.join(script_folder,constants.staging_folder_name)
 
-#Reject unsafe ZIP paths and archives that exceed the safety limits
-def check_zip_safety(archive, temp_folder, filename):
+def _zip_member_hash(archive, member):
+    digest = hashlib.sha256()
+    with archive.open(member) as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.digest()
+
+
+def _zip_members(archive, enforce_limits=False, *, case_sensitive=False):
+    """Validate paths; extraction remains portable, inventories preserve Linux case.
+
+    Only byte-identical repeated artwork entries may collapse to one payload
+    file. The untouched ZIP remains the authority for every original occurrence.
+    """
     members = archive.infolist()
-    seen_names = set()
-    if len(members) > MAX_ZIP_MEMBERS:
-        raise ValueError(f"Too many files in ZIP: {filename}")
-    safe_root = os.path.abspath(temp_folder)
-    total_uncompressed_size = 0
+    if enforce_limits and len(members) > MAX_ZIP_MEMBERS:
+        raise ValueError("Too many files in ZIP.")
+    seen = {}
+    spellings = {}
+    total = 0
+    canonical = []
     for member in members:
-        member_name = member.filename.replace("\\", "/")
-        drive, _ = ntpath.splitdrive(member_name)
-        path_parts = member_name.split("/")
-
-        # Reject duplicate paths that could overwrite one another
-        normalized_name = os.path.normpath(member_name).casefold()
-        if normalized_name in seen_names:
-            raise ValueError(f"Duplicate ZIP entry: {member_name}")
-        seen_names.add(normalized_name)
-
-        # Reject symbolic links stored inside ZIP archives
-        unix_mode = member.external_attr >> 16
-        if stat.S_ISLNK(unix_mode):
-            raise ValueError(f"ZIP contains a symbolic link: {member_name}")
+        name = member.filename
+        relative = name[:-1] if member.is_dir() else name
+        parts = relative.split("/")
+        mode = stat.S_IFMT(member.external_attr >> 16)
         if (
-            not member_name
-            or drive
-            or member_name.startswith("/")
-            or ".." in path_parts
+            not relative or "\\" in name or "\x00" in member.orig_filename
+            or name.startswith("/") or ntpath.splitdrive(name)[0]
+            or any(part in ("", ".", "..") for part in parts)
+            or mode not in (0, stat.S_IFREG, stat.S_IFDIR)
+            or (mode == stat.S_IFDIR and not member.is_dir())
         ):
+            raise ValueError(f"Unsafe ZIP entry: {name}")
+        total += member.file_size
+        if enforce_limits and total > MAX_ZIP_UNCOMPRESSED_BYTES:
+            raise ValueError("ZIP expands beyond the 10 GiB limit.")
+        key = relative if case_sensitive else relative.casefold()
+        if key in seen:
+            previous = seen[key]
+            if (name != previous.filename or member.is_dir() or previous.is_dir()
+                    or Path(name).suffix.lower() not in (".jpg", ".jpeg", ".png", ".pdf")
+                    or member.file_size != previous.file_size
+                    or _zip_member_hash(archive, member) != _zip_member_hash(archive, previous)):
+                raise ValueError(f"Conflicting or unsupported duplicate ZIP entry: {name}")
+            continue
+        seen[key] = member
+        canonical.append(member)
+        for length in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:length])
+            prefix_key = prefix if case_sensitive else prefix.casefold()
+            previous = spellings.setdefault(prefix_key, prefix)
+            if previous != prefix:
+                raise ValueError(f"Case-insensitive ZIP path conflict: {name}")
+    for name in seen:
+        parts = name.split("/")
+        if any((ancestor := seen.get("/".join(parts[:index]))) is not None
+               and not ancestor.is_dir() for index in range(1, len(parts))):
+            raise ValueError(f"ZIP file/directory conflict: {name}")
+    return canonical
+
+
+def check_zip_safety(archive, temp_folder, filename):
+    root = os.path.abspath(temp_folder)
+    members = _zip_members(archive, enforce_limits=True)
+    for member in members:
+        destination = os.path.abspath(os.path.join(root, member.filename))
+        if os.path.commonpath((root, destination)) != root:
             raise ValueError(f"Unsafe path in {filename}: {member.filename}")
-        destination = os.path.abspath(os.path.join(safe_root, *path_parts))
+    return members
+
+
+def _safe_name(value):
+    return (
+        isinstance(value, str) and value not in ("", ".", "..")
+        and Path(value).name == value and "/" not in value
+        and "\\" not in value and not ntpath.splitdrive(value)[0]
+        and "\x00" not in value
+    )
+
+
+def _is_sha256(value):
+    return (isinstance(value, str) and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value))
+
+
+def _validate_payload_manifest(hashes):
+    if not isinstance(hashes, dict):
+        raise ValueError("Invalid payload manifest.")
+    spellings = {}
+    files = set()
+    for relative, checksum in hashes.items():
+        if (not isinstance(relative, str) or "\\" in relative
+                or relative.startswith("/") or ntpath.splitdrive(relative)[0]
+                or any(part in ("", ".", "..") for part in relative.split("/"))
+                or not _is_sha256(checksum)):
+            raise ValueError("Noncanonical payload path or checksum.")
+        parts = relative.split("/")
+        for length in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:length])
+            if spellings.setdefault(prefix.casefold(), prefix) != prefix:
+                raise ValueError("Case-insensitive payload path conflict.")
+        files.add(relative.casefold())
+    for relative in files:
+        parts = relative.split("/")
+        if any("/".join(parts[:index]) in files for index in range(1, len(parts))):
+            raise ValueError("Payload file/directory conflict.")
+
+
+def _safe_directory(path, create=False, missing_ok=False):
+    path = Path(os.path.abspath(path))
+    if any(parent.is_symlink() for parent in (path, *path.parents)):
+        raise ValueError(f"Symbolic link in directory path: {path}")
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    if not path.is_dir() and not (missing_ok and not path.exists()):
+        raise ValueError(f"Unsafe directory: {path}")
+    return path
+
+
+def _sync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_json(path, record):
+    path = Path(path)
+    _safe_directory(path.parent)
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise ValueError(f"Unsafe record path: {path}")
+    descriptor, temporary = tempfile.mkstemp(prefix=".mixie-record-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(record, stream, sort_keys=True, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        _sync_directory(path.parent)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def staging_import_name(source_name, source_kind):
+    """Stable source identity, independent of package contents or Inbox order."""
+    if not _safe_name(source_name) or source_kind not in ("directory", "zip", "file"):
+        raise ValueError("Invalid staging source identity.")
+    identity = json.dumps([source_kind, source_name], ensure_ascii=False).encode("utf-8")
+    suffix = hashlib.sha256(identity).hexdigest()[:16]
+    stem = Path(source_name).stem if source_kind == "zip" else source_name
+    return f"{safe_path_part(stem)[:76]}--mixie-{suffix}"
+
+
+def _provenance_path(import_name, create=False):
+    if not _safe_name(import_name):
+        raise ValueError("Invalid import name.")
+    root = _safe_directory(Path(script_folder) / ".staging-provenance",
+                           create=create, missing_ok=not create)
+    filename = hashlib.sha256(import_name.encode("utf-8")).hexdigest() + ".json"
+    return root / filename
+
+
+def _write_staging_provenance(import_name, record):
+    path = _provenance_path(import_name, create=True)
+    _atomic_json(path, record)
+    _sync_directory(path.parent.parent)
+
+
+def _legacy_adoption_path(import_name):
+    return _provenance_path(import_name).with_suffix(".adopted.json")
+
+
+def _legacy_adoption(import_name):
+    path = _legacy_adoption_path(import_name)
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise ValueError("Unsafe legacy adoption marker.")
+    if not path.exists():
+        return None
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ValueError("Invalid legacy adoption marker.") from error
+    if (not isinstance(record, dict) or record.get("version") != 1
+            or record.get("import_name") != import_name
+            or not _safe_name(record.get("source_name"))
+            or record.get("source_kind") not in ("directory", "zip", "file")):
+        raise ValueError("Invalid legacy adoption identity.")
+    return record
+
+
+def staging_provenance(import_name, *, verify_payload=True):
+    """Read committed provenance; None means legacy, never an unproven managed ID.
+
+    Records stay outside payloads and survive quarantine/purge. Callers examining
+    a held copy use verify_payload=False, then verify that copy against the record.
+    """
+    if not _safe_name(import_name) or import_name.startswith(".mixie-pending-"):
+        raise ValueError("Pending or invalid staged import.")
+    path = _provenance_path(import_name)
+    adoption = _legacy_adoption(import_name)
+    if path.is_symlink():
+        raise ValueError("Unsafe staging provenance.")
+    if not path.exists():
+        if "--mixie-" in import_name or adoption is not None:
+            raise ValueError("Missing provenance for managed or adopted legacy staged import.")
+        return None
+    if not path.is_file():
+        raise ValueError("Invalid staging provenance path.")
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ValueError("Invalid staging provenance JSON.") from error
+    if not isinstance(record, dict) or record.get("state") != "committed":
+        raise ValueError("Uncommitted staged import requires recovery.")
+    hashes = record.get("payload_hashes")
+    kind = record.get("source_kind")
+    source_name = record.get("source_name")
+    transaction = record.get("transaction_id")
+    checksum = record.get("source_sha256")
+
+    legacy_name = Path(source_name).stem if isinstance(source_name, str) and kind == "zip" else source_name
+    adopted = (record.get("adopted_legacy") is True and "--mixie-" not in import_name
+               and legacy_name == import_name and adoption is not None
+               and adoption["source_name"] == source_name and adoption["source_kind"] == kind)
+    if (
+        record.get("version") != 1 or record.get("kind") != "staged_import"
+        or record.get("import_name") != import_name
+        or not _safe_name(source_name) or kind not in ("directory", "zip", "file")
+        or (staging_import_name(source_name, kind) != import_name and not adopted)
+        or (adoption is not None and not adopted)
+        or not isinstance(transaction, str) or len(transaction) != 32
+        or any(character not in "0123456789abcdef" for character in transaction)
+        or not isinstance(hashes, dict) or not hashes
+        or (kind == "directory" and checksum is not None)
+        or (kind != "directory" and not _is_sha256(checksum))
+        or (kind == "zip" and Path(source_name).suffix.lower() != ".zip")
+        or (kind == "file" and Path(source_name).suffix.lower() not in constants.music_file_types)
+    ):
+        raise ValueError("Invalid staged-import provenance.")
+    _validate_payload_manifest(hashes)
+    duplicates = record.get("duplicate_zip_entries", [])
+    if (not isinstance(duplicates, list) or any(not isinstance(name, str) for name in duplicates)
+            or duplicates != sorted(set(duplicates))
+            or any(name not in hashes or Path(name).suffix.lower() not in (".jpg", ".jpeg", ".png", ".pdf")
+                   for name in duplicates)
+            or (duplicates and kind != "zip")):
+        raise ValueError("Invalid duplicate ZIP provenance.")
+    if verify_payload:
+        stage = _safe_directory(Path(staging_folder) / import_name)
+        if file_manifest(stage) != hashes:
+            raise RuntimeError("Staged payload changed since commit.")
+    return record
+
+
+def is_committed_stage(path):
+    """Strict scan helper: legacy/unproven, pending, symlinked or altered => False."""
+    path = Path(os.path.abspath(path))
+    try:
+        root = _safe_directory(staging_folder)
+        return path.parent == root and staging_provenance(path.name) is not None
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def committed_staging_imports():
+    root = _safe_directory(staging_folder)
+    return [path for path in sorted(root.iterdir()) if is_committed_stage(path)]
+
+
+def _source_snapshot(source):
+    source = Path(source)
+    _safe_directory(source.parent)
+    if source.is_symlink():
+        raise ValueError("Symbolic link in import source.")
+    if source.is_dir():
+        payload = file_manifest(_safe_directory(source))
+        _validate_payload_manifest(payload)
+        return "directory", None, payload
+    if not source.is_file():
+        raise ValueError("Unsupported import source.")
+    checksum = file_checksum(source).hex()
+    if source.suffix.lower() == ".zip":
+        with zipfile.ZipFile(source) as saved:
+            check_zip_safety(saved, staging_folder, source.name)
+        payload = zip_manifest(source)
+        _validate_payload_manifest(payload)
+        if file_checksum(source).hex() != checksum:
+            raise RuntimeError("Original ZIP changed during verification.")
+        return "zip", checksum, payload
+    if source.suffix.lower() in constants.music_file_types:
+        payload = {source.name: checksum}
+        _validate_payload_manifest(payload)
+        return "file", checksum, payload
+    raise ValueError("Unsupported import source.")
+
+
+def _verify_provenance_source(record, source):
+    kind, checksum, payload = _source_snapshot(source)
+    if (
+        Path(source).name != record["source_name"] or kind != record["source_kind"]
+        or checksum != record["source_sha256"] or payload != record["payload_hashes"]
+    ):
+        raise RuntimeError("Original download changed since staging.")
+    return payload
+
+
+def _staging_record(source, name, kind, checksum, payload, *, adopted_legacy=False):
+    record = {
+        "version": 1, "kind": "staged_import", "state": "pending",
+        "import_name": name, "transaction_id": uuid.uuid4().hex,
+        "source_name": source.name, "source_kind": kind,
+        "source_sha256": checksum, "payload_hashes": payload,
+    }
+    if adopted_legacy:
+        record["adopted_legacy"] = True
+    if kind == "zip":
+        with zipfile.ZipFile(source) as saved:
+            names = [member.filename for member in saved.infolist() if not member.is_dir()]
+            seen, duplicates = set(), set()
+            for relative in names:
+                if relative in seen:
+                    duplicates.add(relative)
+                seen.add(relative)
+        if duplicates:
+            record["duplicate_zip_entries"] = sorted(duplicates)
+    return record
+
+
+def _adopt_legacy_stage(source, stage, kind, checksum, payload):
+    # A full inventory comparison is new proof, not a claim about old provenance.
+    if not payload or file_manifest(stage) != payload:
+        raise ValueError("Unverified legacy staging differs from the full original; reconciliation required.")
+    record = _staging_record(source, stage.name, kind, checksum, payload, adopted_legacy=True)
+    _verify_provenance_source(record, source)
+    _sync_payload(stage, payload)
+    # A durable marker prevents missing provenance from downgrading this source
+    # back to unmanaged legacy authority. Neither record is removed on failure.
+    _provenance_path(stage.name, create=True)
+    _atomic_json(_legacy_adoption_path(stage.name), {
+        "version": 1, "import_name": stage.name,
+        "source_name": source.name, "source_kind": kind,
+    })
+    _write_staging_provenance(stage.name, record)
+    if file_manifest(stage) != payload:
+        raise RuntimeError("Legacy staged payload changed during adoption.")
+    _verify_provenance_source(record, source)
+    _write_staging_provenance(stage.name, {**record, "state": "committed"})
+    return str(stage)
+
+
+def _sync_payload(root, hashes):
+    for relative in hashes:
+        path = root / relative
+        _safe_directory(path.parent)
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         try:
-            stays_inside_temp = (
-                os.path.commonpath((safe_root, destination)) == safe_root
-            )
-        except ValueError:
-            stays_inside_temp = False
-        if not stays_inside_temp:
-            raise ValueError(f"Unsafe path in {filename}: {member.filename}")
-        total_uncompressed_size += member.file_size
-        if total_uncompressed_size > MAX_ZIP_UNCOMPRESSED_BYTES:
-            raise ValueError(f"ZIP expands beyond the 10 GiB limit: {filename}")
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise ValueError("Unsupported staged file.")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    for directory in sorted((path for path in root.rglob("*") if path.is_dir()),
+                            key=lambda path: len(path.parts), reverse=True):
+        _sync_directory(directory)
+    _sync_directory(root)
+
+
+@contextmanager
+def _staging_lock():
+    root = _provenance_path("lock", create=True).parent
+    descriptor = os.open(root / ".lock", os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("Unsafe staging lock.")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError("Another staging operation is active.") from error
+        yield
+    finally:
+        os.close(descriptor)
 
 # Process new music imports from the Inbox
 def sort_inbox():
+    _safe_directory(inbox_folder, create=True)
+    _safe_directory(staging_folder, create=True)
+    with _staging_lock():
+        return _sort_inbox_locked()
 
-    # Never restage an Inbox source while its previous cleanup
-    # transaction is incomplete.
-    quarantine_root = (
-        Path(script_folder)
-        / constants.backup_folder_name
-        / ".cleanup-quarantine"
-    )
 
-    if quarantine_root.is_symlink():
-        raise RuntimeError("Unsafe cleanup quarantine path.")
+def _sort_inbox_locked():
+    staging = _safe_directory(staging_folder)
+    if any(path.name.startswith(".mixie-pending-") for path in staging.iterdir()):
+        raise RuntimeError("Pending staging import requires recovery before ingestion.")
+    backup = _safe_directory(Path(script_folder) / constants.backup_folder_name, missing_ok=True)
+    # A prepared finalizer may already hold part of a delivery outside Inbox.
+    # Do not create a new occurrence until explicit authorized recovery finishes.
+    import mixie_finalizer
+    if os.path.lexists(backup / mixie_finalizer.LEDGER_NAME) and mixie_finalizer._state()['active'] is not None:
+        raise RuntimeError("Pending finalization cleanup requires authorized recovery before staging new imports.")
+    quarantine = _safe_directory(backup / ".cleanup-quarantine", missing_ok=True)
+    if quarantine.exists() and any(
+        path.name.startswith((".mixie-inbox-", ".mixie-archived-"))
+        for path in quarantine.iterdir()
+    ):
+        raise RuntimeError("Pending cleanup requires recovery before staging new imports.")
 
-    if quarantine_root.exists():
-        if not quarantine_root.is_dir():
-            raise RuntimeError("Invalid cleanup quarantine.")
-
-        for folder in quarantine_root.iterdir():
-            if not folder.name.startswith(".mixie-inbox-"):
-                continue
-
-            if folder.is_symlink() or not folder.is_dir():
-                raise RuntimeError(
-                    f"Unsafe cleanup transaction: {folder}"
-                )
-
-            journal = folder / "recovery.json"
-            held_stage = folder / "staging"
-            held_source = folder / "original"
-
-            if (
-                journal.is_symlink()
-                or held_stage.is_symlink()
-                or held_source.is_symlink()
-            ):
-                raise RuntimeError("Unsafe cleanup recovery paths.")
-
-            if not journal.is_file():
-                if any(folder.iterdir()):
-                    raise RuntimeError(
-                        f"Incomplete cleanup journal: {folder}"
-                    )
-                continue
-
-            # Both held means fully quarantined.
-            # Anything else requires recovery before ingesting.
-            if not (
-                held_stage.exists()
-                and held_source.exists()
-            ):
-                raise RuntimeError(
-                    "Interrupted Inbox cleanup detected. "
-                    "Restore the pending transaction before ingestion."
-                )
-
-    # Prepare the directories used for importing
-    os.makedirs(inbox_folder, exist_ok=True)
-    os.makedirs(staging_folder, exist_ok=True)
     staged_imports = []
-    for filename in sorted(os.listdir(inbox_folder)):
-        source_path = os.path.join(inbox_folder, filename)
-
-        # Never follow symbolic links from Inbox
-        if os.path.islink(source_path):
-            print(f"Skipping symbolic link: {filename}")
+    for source in sorted(Path(inbox_folder).iterdir()):
+        if source.is_symlink():
+            print(f"Skipping symbolic link: {source.name}")
             continue
-        is_folder = os.path.isdir(source_path)
-        is_zip = (
-            os.path.isfile(source_path)
-            and filename.lower().endswith(".zip")
-        )
-        is_music_file = (
-            os.path.isfile(source_path)
-            and filename.lower().endswith(constants.music_file_types)
-        )
-        if not (is_folder or is_zip or is_music_file):
-            print(f"Unsupported Inbox item: {filename}")
+        if not (source.is_dir() or (source.is_file() and
+                source.suffix.lower() in (".zip", *constants.music_file_types))):
+            print(f"Unsupported Inbox item: {source.name}")
             continue
-
-        # Each import gets its own staging folder
-        import_name = os.path.splitext(filename)[0] if is_zip else filename
-        import_folder = os.path.join(staging_folder, import_name)
-        if os.path.lexists(import_folder):
-            print(f"Already staged, skipping: {filename}")
-            continue
-
-        # Work in a temporary folder until the import is complete
-        pending_folder = tempfile.mkdtemp(
-            prefix=".mixie-pending-",
-            dir=staging_folder
-        )
+        pending = None
         try:
-            if is_zip:
-                with zipfile.ZipFile(source_path, "r") as archive:
-                    check_zip_safety(archive, pending_folder, filename)
-                    bad_file = archive.testzip()
-                    if bad_file is not None:
-                        raise ValueError(f"Damaged ZIP entry: {bad_file}")
-                    archive.extractall(pending_folder)
-            elif is_folder:
-                # Do not follow links hidden inside folders
-                for root, directories, files in os.walk(source_path):
-                    for name in directories + files:
-                        item_path = os.path.join(root, name)
-
-                        if os.path.islink(item_path):
-                            raise ValueError(
-                                f"Symbolic link found: {item_path}"
-                            )
-                shutil.copytree(
-                    source_path,
-                    pending_folder,
-                    dirs_exist_ok=True
-                )
+            kind, checksum, payload = _source_snapshot(source)
+            name = staging_import_name(source.name, kind)
+            destination = staging / name
+            legacy_name = source.stem if kind == "zip" else source.name
+            legacy = staging / legacy_name
+            if os.path.lexists(legacy):
+                previous = staging_provenance(legacy_name)
+                if previous is None:
+                    if "--mixie-" in legacy_name or legacy_name.startswith(".mixie-"):
+                        raise ValueError("Unproven managed staging destination requires recovery.")
+                    staged_imports.append(_adopt_legacy_stage(source, legacy, kind, checksum, payload))
+                    print(f"Verified and adopted unchanged legacy stage: {source.name} -> {legacy_name}")
+                    continue
+                if (previous["source_name"], previous["source_kind"]) == (source.name, kind):
+                    _verify_provenance_source(previous, source)
+                    print(f"Verified unchanged staged import: {source.name}")
+                    continue
+                # A proven different source (e.g. directory versus ZIP) gets its
+                # own managed delivery, never somebody else's legacy authority.
+            if os.path.lexists(destination):
+                record = staging_provenance(name)
+                _verify_provenance_source(record, source)
+                print(f"Verified unchanged staged import: {source.name}")
+                continue
+            # An interrupted metadata commit must not be overwritten on retry.
+            if os.path.lexists(_provenance_path(name)):
+                staging_provenance(name, verify_payload=False)
+            if not payload or not any(Path(relative).suffix.lower() in constants.music_file_types
+                                      for relative in payload):
+                raise ValueError("No supported music files found.")
+            pending = Path(tempfile.mkdtemp(prefix=".mixie-pending-", dir=staging))
+            if kind == "zip":
+                with zipfile.ZipFile(source) as saved:
+                    members = check_zip_safety(saved, pending, source.name)
+                    saved.extractall(pending, members=members)
+            elif kind == "directory":
+                shutil.copytree(source, pending, dirs_exist_ok=True)
             else:
-                # Stage a loose audio file without modifying it
-                shutil.copy2(
-                    source_path,
-                    os.path.join(pending_folder, filename)
-                )
-
-            # Check for at least one supported audio file
-            music_found = any(
-                name.lower().endswith(constants.music_file_types)
-                for _, _, names in os.walk(pending_folder)
-                for name in names
-            )
-            if not music_found:
-                raise ValueError("No supported music files found")
-
-            # Never replace an existing staging folder
-            if os.path.lexists(import_folder):
-                raise FileExistsError(import_folder)
-
-            # Commit the completed import
-            os.rename(pending_folder, import_folder)
-            staged_imports.append(import_folder)
-            print(f"Successfully staged: {filename}")
-        except ( OSError, ValueError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as error:
-            print(f"Import failed: {filename} - {error}")
+                shutil.copy2(source, pending / source.name)
+            if file_manifest(pending) != payload:
+                raise RuntimeError("Staged copy differs from original download.")
+            record = _staging_record(source, name, kind, checksum, payload)
+            _verify_provenance_source(record, source)
+            _sync_payload(pending, payload)
+            _write_staging_provenance(name, record)
+            if os.path.lexists(destination):
+                raise FileExistsError(destination)
+            pending.rename(destination)
+            _sync_directory(staging)
+            if file_manifest(destination) != payload:
+                raise RuntimeError("Staged payload changed before commit.")
+            _verify_provenance_source(record, source)
+            record = {**record, "state": "committed"}
+            _write_staging_provenance(name, record)
+            staged_imports.append(str(destination))
+            print(f"Successfully staged: {source.name} -> {name}")
+        except (OSError, ValueError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as error:
+            print(f"Import deferred: {source.name} - {error}")
         finally:
-
-            # Remove any incomplete temporary import
-            if os.path.exists(pending_folder):
-                shutil.rmtree(pending_folder)
-
+            # Never remove a published payload, even if its commit record failed.
+            if pending is not None and pending.exists():
+                shutil.rmtree(pending)
     print(f"Staging complete: {len(staged_imports)} imports")
     return staged_imports
 
@@ -265,12 +560,24 @@ def validate_source_track(track_path, source_root):
         raise ValueError("Unsupported audio format")
     return source
 
-# Calculate a file's checksum
+def _file_identity(attributes):
+    return (attributes.st_dev, attributes.st_ino, attributes.st_mode,
+            attributes.st_size, attributes.st_mtime_ns, attributes.st_ctime_ns)
+
+
+# Calculate a stable regular file's checksum without following a leaf symlink.
 def file_checksum(path):
     checksum = hashlib.sha256()
-    with open(path, "rb") as file:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                         | getattr(os, "O_NONBLOCK", 0))
+    with os.fdopen(descriptor, "rb") as file:
+        before = os.fstat(file.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"Unsupported file: {path}")
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
             checksum.update(chunk)
+        if _file_identity(os.fstat(file.fileno())) != _file_identity(before):
+            raise RuntimeError(f"File changed during hashing: {path}")
     return checksum.digest()
 
 # Copy an approved sorting plan into the library
@@ -303,8 +610,9 @@ def copy_sorting_plan(planned_tracks):
                 raise IOError(f"Copy verification failed: {destination}")
 
             print(f"Copied and verified: {destination}")
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError):
 
+        # Mutation detection is a verification failure and must also roll back.
         # Remove only files created during this operation
         for path in reversed(copied_files):
             try:
@@ -440,10 +748,11 @@ def plan_album_assets(verified_assets, source_root):
         if any(part in ("", ".", "..") for part in parts):
             raise ValueError("Unsafe asset path")
         album = safe_path_part(asset["album"])
+        folder_album = safe_path_part(asset.get("folder_album") or asset["album"])
         album_folder = os.path.join(
             music_library_folder,
             safe_path_part(asset["album_artist"]),
-            album
+            folder_album
         )
 
         # Source may already be organized in a library extras folder.
@@ -558,7 +867,7 @@ def plan_library_sort(verified_tracks, approved=False, source_root=None, check_e
                 drive_folder,
                 constants.library_folder_name,
                 safe_path_part(track["album_artist"]),
-                safe_path_part(track["album"])
+                safe_path_part(track.get("folder_album") or track["album"])
             )
 
             # Check whether this album needs disc folders
@@ -842,178 +1151,130 @@ def reorganize_library(
 
 # Inventory files without following symbolic links
 def file_manifest(folder):
-    root = Path(folder)
-
-    if root.is_symlink() or not root.is_dir():
-        raise ValueError(f"Unsafe directory: {root}")
-
+    root = _safe_directory(folder)
     manifest = {}
+    identities = {}
 
-    for current, directories, filenames in os.walk(root):
-        for name in directories + filenames:
-            path = Path(current) / name
+    def visit(directory):
+        before = directory.stat(follow_symlinks=False)
+        if not stat.S_ISDIR(before.st_mode):
+            raise ValueError(f"Unsafe directory: {directory}")
+        # Capture directory identity before enumeration, not after os.walk yields.
+        identities[directory] = _file_identity(before)
+        for path in sorted(directory.iterdir()):
+            attributes = path.stat(follow_symlinks=False)
+            if stat.S_ISDIR(attributes.st_mode):
+                visit(path)
+            elif stat.S_ISREG(attributes.st_mode):
+                identities[path] = _file_identity(attributes)
+                manifest[path.relative_to(root).as_posix()] = file_checksum(path).hex()
+            else:
+                raise ValueError(f"Symbolic link or unsupported file: {path}")
 
-            if path.is_symlink():
-                raise ValueError(f"Symbolic link: {path}")
-
-        for name in filenames:
-            path = Path(current) / name
-
-            if not path.is_file():
-                raise ValueError(f"Unsupported file: {path}")
-
-            relative = path.relative_to(root).as_posix()
-            manifest[relative] = file_checksum(path).hex()
-
+    visit(root)
+    # This evidence is local to this call; it is never a persistent stat cache.
+    for path, expected in identities.items():
+        if _file_identity(path.stat(follow_symlinks=False)) != expected:
+            raise RuntimeError(f"Inventory changed during hashing: {path}")
     return manifest
 
 
 # Inspect ZIP contents using SHA-256, not just ZIP CRC
 def zip_manifest(path):
     result = {}
-    seen = set()
-
     with zipfile.ZipFile(path) as saved:
-        for member in saved.infolist():
-            name = member.filename.replace("\\", "/")
-
+        for member in _zip_members(saved, case_sensitive=True):
             if member.is_dir():
                 continue
-
-            parts = name.split("/")
-
-            if (
-                not name
-                or name.startswith("/")
-                or ntpath.splitdrive(name)[0]
-                or any(part in ("", ".", "..") for part in parts)
-                or stat.S_ISLNK(member.external_attr >> 16)
-            ):
-                raise ValueError(f"Unsafe ZIP entry: {name}")
-
-            if name.casefold() in seen:
-                raise ValueError(f"Duplicate ZIP entry: {name}")
-
-            seen.add(name.casefold())
             digest = hashlib.sha256()
-
             with saved.open(member) as source:
-                for chunk in iter(
-                    lambda: source.read(1024 * 1024), b""
-                ):
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
                     digest.update(chunk)
-
-            result[name] = digest.hexdigest()
-
+            result[member.filename] = digest.hexdigest()
     return result
 
 # Find fully completed source imports
-def plan_ingest_cleanup(completed_keys):
+def _check_import_tracks(stage, albums, staged_files):
+    actual = {relative for relative in staged_files
+              if Path(relative).suffix.lower() in constants.music_file_types}
+    discovered = {Path(track["path"]).relative_to(stage).as_posix()
+                  for _, album in albums for track in album["tracks"]}
+    if not actual or actual != discovered:
+        raise ValueError("Unaccounted staged music.")
+    unsupported = {".wav", ".aif", ".aiff", ".m4a", ".aac", ".ogg", ".opus",
+                   ".wma", ".ape", ".wv", ".dsf", ".dff"}
+    if any(Path(relative).suffix.lower() in unsupported for relative in staged_files):
+        raise ValueError("Unsupported audio remains in staging.")
+
+
+def _check_candidate_provenance(item, staged_hashes, source=None):
+    record = staging_provenance(item["name"], verify_payload=False)
+    if record != item.get("provenance"):
+        raise RuntimeError("Staging provenance changed during cleanup.")
+    if staged_hashes != item["staged_hashes"]:
+        raise RuntimeError("Staging changed during cleanup.")
+    if record is not None:
+        if staged_hashes != record["payload_hashes"]:
+            raise RuntimeError("Staging differs from committed provenance.")
+        if source is not None:
+            _verify_provenance_source(record, source)
+    return record
+
+
+def plan_ingest_cleanup(completed_keys, *, _quiet=False):
     import tag
 
     completed_keys = set(completed_keys)
     grouped = {}
-
     for key, album in tag.group_staged_albums().items():
         grouped.setdefault(key[0], []).append((key, album))
-
-    inbox_sources = {}
-
-    for source in Path(inbox_folder).iterdir():
+    inbox = _safe_directory(inbox_folder)
+    legacy_sources = {}
+    for source in inbox.iterdir():
         if source.is_symlink():
             continue
-
         if source.is_dir():
             name = source.name
         elif source.is_file() and source.suffix.lower() == ".zip":
             name = source.stem
-        elif (
-            source.is_file()
-            and source.suffix.lower() in constants.music_file_types
-        ):
+        elif source.is_file() and source.suffix.lower() in constants.music_file_types:
             name = source.name
         else:
             continue
-
-        inbox_sources.setdefault(name, []).append(source)
-
+        legacy_sources.setdefault(name, []).append(source)
     ready = []
-
     for name, albums in grouped.items():
-        sources = inbox_sources.get(name, [])
-
-        if len(sources) != 1:
-            print(f"Cleanup deferred, ambiguous source: {name}")
-            continue
-
-        if not all(key in completed_keys for key, _ in albums):
-            print(f"Cleanup deferred, incomplete import: {name}")
-            continue
-
-        source = sources[0]
-        stage = Path(staging_folder) / name
-
         try:
-            staged_files = file_manifest(stage)
-
-            # All supported tracks must be accounted for
-            actual_music = {
-                filename
-                for filename in staged_files
-                if Path(filename).suffix.lower()
-                in constants.music_file_types
-            }
-
-            discovered_music = {
-                Path(track["path"]).relative_to(stage).as_posix()
-                for _, album in albums
-                for track in album["tracks"]
-            }
-
-            if not actual_music or actual_music != discovered_music:
-                raise ValueError("Unaccounted staged music.")
-
-            # Don't discard formats MIXIE cannot ingest yet
-            unsupported_audio = {
-                ".wav", ".aif", ".aiff", ".m4a", ".aac",
-                ".ogg", ".opus", ".wma", ".ape", ".wv",
-                ".dsf", ".dff"
-            }
-
-            if any(
-                Path(filename).suffix.lower() in unsupported_audio
-                for filename in staged_files
-            ):
-                raise ValueError("Unsupported audio remains in staging.")
-
-            # Verify staging still matches the original download
-            if source.is_dir():
-                original_files = file_manifest(source)
-            elif source.suffix.lower() == ".zip":
-                original_files = zip_manifest(source)
-            else:
-                original_files = {
-                    source.name: file_checksum(source).hex()
-                }
-
-            if staged_files != original_files:
+            record = staging_provenance(name, verify_payload=False)
+            sources = ([inbox / record["source_name"]] if record is not None
+                       else legacy_sources.get(name, []))
+            if len(sources) != 1:
+                raise ValueError("Ambiguous original source.")
+            if not all(key in completed_keys for key, _ in albums):
+                raise ValueError("Incomplete import.")
+            source = sources[0]
+            stage = Path(staging_folder) / name
+            staged = file_manifest(stage)
+            _check_import_tracks(stage, albums, staged)
+            kind, checksum, original = _source_snapshot(source)
+            if staged != original:
                 raise ValueError("Staging differs from original download.")
-
-        except (OSError, ValueError, zipfile.BadZipFile) as error:
-            print(f"Cleanup blocked: {name}: {error}")
+            if record is not None and (
+                original != record["payload_hashes"] or kind != record["source_kind"]
+                or checksum != record["source_sha256"]
+            ):
+                raise ValueError("Original download differs from committed provenance.")
+        except (OSError, ValueError, RuntimeError, zipfile.BadZipFile) as error:
+            if not _quiet:
+                print(f"Cleanup blocked: {name}: {error}")
             continue
-
         ready.append({
-            "name": name,
-            "source": source,
-            "stage": stage,
-            "albums": albums,
-            "original_hashes": original_files,
-            "staged_hashes": staged_files
+            "name": name, "source": source, "stage": stage, "albums": albums,
+            "original_hashes": original, "staged_hashes": staged,
+            "source_sha256": checksum, "provenance": record,
         })
-
-        print(f"Cleanup eligible: {name} ({len(albums)} album(s))")
-
+        if not _quiet:
+            print(f"Cleanup eligible: {name} ({len(albums)} album(s))")
     return ready
 
 
@@ -1022,14 +1283,10 @@ def plan_ingest_cleanup(completed_keys):
 def plan_archived_cleanup(completed, originals_zip):
     import tag
 
-    bulk = Path(originals_zip).resolve()
-    expected = (
-        Path(script_folder)
-        / constants.backup_folder_name
-        / "OriginalDownloads-Bulk.zip"
-    ).resolve()
-
-    if bulk != expected or not bulk.is_file():
+    backup = _safe_directory(Path(script_folder) / constants.backup_folder_name)
+    bulk = Path(originals_zip)
+    expected = backup / "OriginalDownloads-Bulk.zip"
+    if bulk.is_symlink() or bulk.resolve() != expected or not bulk.is_file():
         raise ValueError("Verified cumulative archive required.")
 
     # Verify the entire outer archive before trusting its entries
@@ -1040,63 +1297,36 @@ def plan_archived_cleanup(completed, originals_zip):
         grouped.setdefault(key[0], []).append((key, album))
 
     ready = []
-    inbox = Path(inbox_folder)
+    inbox = _safe_directory(inbox_folder)
+    inbox_items = list(inbox.iterdir())
 
     with zipfile.ZipFile(bulk) as outer:
         for name, albums in sorted(grouped.items()):
-            # Imports with a current Inbox source use the old planner
-            if any(
-                item.name == name
-                or (
-                    item.suffix.lower() == ".zip"
-                    and item.stem == name
-                )
-                for item in inbox.iterdir()
-            ):
-                continue
-
-            if not all(key in completed for key, _ in albums):
-                print(f"Archived cleanup deferred: {name} (unfinished)")
-                continue
-
-            archive_name = f"{name}.zip"
-            if archive_name not in archived:
-                print(f"Archived cleanup deferred: {name} (no ZIP)")
-                continue
-
-            stage = Path(staging_folder) / name
-
             try:
+                record = staging_provenance(name, verify_payload=False)
+                if record is not None:
+                    source = inbox / record["source_name"]
+                    if source.exists() or source.is_symlink():
+                        continue
+                    if record["source_kind"] != "zip":
+                        raise ValueError("Archived-only cleanup requires original ZIP provenance.")
+                    archive_name = record["source_name"]
+                    if archived.get(archive_name) != record["source_sha256"]:
+                        raise ValueError("Archived original differs from committed provenance.")
+                else:
+                    if any(item.name == name or (item.suffix.lower() == ".zip" and item.stem == name)
+                           for item in inbox_items):
+                        continue
+                    archive_name = f"{name}.zip"
+                if not all(key in completed for key, _ in albums):
+                    raise ValueError("Unfinished import.")
+                if archive_name not in archived:
+                    raise ValueError("No original ZIP in cumulative archive.")
+                stage = Path(staging_folder) / name
                 staged = file_manifest(stage)
-                if not staged:
-                    raise ValueError("Empty staged import")
-
-                actual_music = {
-                    relative for relative in staged
-                    if Path(relative).suffix.lower()
-                    in constants.music_file_types
-                }
-
-                discovered_music = {
-                    Path(track["path"]).relative_to(stage).as_posix()
-                    for _, album in albums
-                    for track in album["tracks"]
-                }
-
-                if actual_music != discovered_music:
-                    raise ValueError("Unaccounted staged music")
-
-                unsupported_audio = {
-                    ".wav", ".aif", ".aiff", ".m4a",
-                    ".aac", ".ogg", ".opus", ".wma",
-                    ".ape", ".wv", ".dsf", ".dff"
-                }
-
-                if any(
-                    Path(relative).suffix.lower() in unsupported_audio
-                    for relative in staged
-                ):
-                    raise ValueError("Unsupported audio remains")
+                _check_import_tracks(stage, albums, staged)
+                if record is not None and staged != record["payload_hashes"]:
+                    raise ValueError("Staged payload differs from committed provenance.")
 
                 with tempfile.TemporaryFile() as temporary:
                     with outer.open(archive_name) as source:
@@ -1133,6 +1363,9 @@ def plan_archived_cleanup(completed, originals_zip):
                 "name": name,
                 "stage": stage,
                 "archived_source": archive_name,
+                "archived_source_hash": archived[archive_name],
+                "staged_hashes": staged,
+                "provenance": record,
                 "albums": albums
             })
 
@@ -1142,9 +1375,7 @@ def plan_archived_cleanup(completed, originals_zip):
 
 # Verify archived-source cleanup candidates without deleting anything
 def verify_archived_cleanup(completed, originals_zip, library_zip):
-    backup_root = (
-        Path(script_folder) / constants.backup_folder_name
-    ).resolve()
+    backup_root = _safe_directory(Path(script_folder) / constants.backup_folder_name)
 
     bulk = Path(originals_zip)
     snapshot = Path(library_zip)
@@ -1176,7 +1407,7 @@ def verify_archived_cleanup(completed, originals_zip, library_zip):
             )
 
     # The snapshot must contain the current Music Library exactly
-    library_root = Path(music_library_folder).resolve()
+    library_root = _safe_directory(music_library_folder)
     current_library = file_manifest(library_root)
     archived_library = zip_manifest(snapshot)
 
@@ -1193,6 +1424,9 @@ def verify_archived_cleanup(completed, originals_zip, library_zip):
             raise ValueError("Invalid staged import.")
 
         staged_hashes = file_manifest(stage)
+        _check_candidate_provenance(item, staged_hashes)
+        if archived_originals.get(item["archived_source"]) != item["archived_source_hash"]:
+            raise RuntimeError("Original archive changed during cleanup verification.")
 
         for key, album in item["albums"]:
             receipt = completed.get(key)
@@ -1243,11 +1477,9 @@ def verify_archived_cleanup(completed, originals_zip, library_zip):
     print("PREVIEW ONLY: No files removed.")
     return verified
 
-def verify_inbox_cleanup(completed, originals_zip, library_zip):
+def verify_inbox_cleanup(completed, originals_zip, library_zip, *, _quiet=False):
     """Preview Inbox-backed cleanup with full archive verification."""
-    backup_root = (
-        Path(script_folder) / constants.backup_folder_name
-    ).resolve()
+    backup_root = _safe_directory(Path(script_folder) / constants.backup_folder_name)
 
     bulk = Path(originals_zip)
     snapshot = Path(library_zip)
@@ -1278,14 +1510,14 @@ def verify_inbox_cleanup(completed, originals_zip, library_zip):
                 f"Inbox file is not safely archived: {relative}"
             )
 
-    library_root = Path(music_library_folder).resolve()
+    library_root = _safe_directory(music_library_folder)
     current_library = file_manifest(library_root)
     archived_library = zip_manifest(snapshot)
 
     if current_library != archived_library:
         raise RuntimeError("Library backup is not current.")
 
-    candidates = plan_ingest_cleanup(completed)
+    candidates = plan_ingest_cleanup(completed, _quiet=_quiet)
     ready = []
 
     for item in candidates:
@@ -1330,8 +1562,9 @@ def verify_inbox_cleanup(completed, originals_zip, library_zip):
             if originals != item["original_hashes"]:
                 raise RuntimeError("Original file contents changed.")
 
-        if file_manifest(stage) != item["staged_hashes"]:
-            raise RuntimeError("Staging changed.")
+        _check_candidate_provenance(item, file_manifest(stage), source)
+        if not source.is_dir() and digest != item["source_sha256"]:
+            raise RuntimeError("Original package changed during cleanup verification.")
 
         # Every completed album must have valid library receipts.
         for key, album in item["albums"]:
@@ -1370,10 +1603,12 @@ def verify_inbox_cleanup(completed, originals_zip, library_zip):
                     )
 
         ready.append(item)
-        print(f"Inbox-backed cleanup verified: {item['name']}")
+        if not _quiet:
+            print(f"Inbox-backed cleanup verified: {item['name']}")
 
-    print(f"\nVerified Inbox-backed imports: {len(ready)}")
-    print("PREVIEW ONLY: Nothing moved or deleted.")
+    if not _quiet:
+        print(f"\nVerified Inbox-backed imports: {len(ready)}")
+        print("PREVIEW ONLY: Nothing moved or deleted.")
     return ready
 
 def quarantine_inbox_cleanup(
@@ -1391,9 +1626,7 @@ def quarantine_inbox_cleanup(
     if not ready:
         return []
 
-    backup_root = (
-        Path(script_folder) / constants.backup_folder_name
-    ).resolve()
+    backup_root = _safe_directory(Path(script_folder) / constants.backup_folder_name)
     quarantine_root = backup_root / ".cleanup-quarantine"
 
     if quarantine_root.is_symlink():
@@ -1401,8 +1634,8 @@ def quarantine_inbox_cleanup(
 
     quarantine_root.mkdir(parents=True, exist_ok=True)
 
-    inbox_root = Path(inbox_folder).resolve()
-    staged_root = Path(staging_folder).resolve()
+    inbox_root = _safe_directory(inbox_folder)
+    staged_root = _safe_directory(staging_folder)
 
     def sync_directory(directory):
         descriptor = os.open(
@@ -1436,6 +1669,7 @@ def quarantine_inbox_cleanup(
         for existing in quarantine_root.glob(
             ".mixie-inbox-*/recovery.json"
         ):
+            _safe_directory(existing.parent)
             if existing.is_symlink():
                 raise RuntimeError("Unsafe recovery journal.")
 
@@ -1449,15 +1683,15 @@ def quarantine_inbox_cleanup(
 
         # Reverify eligibility immediately before the move.
         fresh = verify_inbox_cleanup(
-            completed, originals_zip, library_zip
+            completed, originals_zip, library_zip, _quiet=True
         )
-
-        if name not in {entry["name"] for entry in fresh}:
-            raise RuntimeError(
-                f"Cleanup eligibility changed: {name}"
-            )
+        matching = next((entry for entry in fresh if entry["name"] == name), None)
+        fields = ("source", "stage", "provenance", "staged_hashes", "original_hashes", "source_sha256")
+        if matching is None or any(matching.get(field) != item.get(field) for field in fields):
+            raise RuntimeError(f"Cleanup eligibility changed: {name}")
 
         staged_hashes = file_manifest(stage)
+        provenance = _check_candidate_provenance(item, staged_hashes, source)
 
         if staged_hashes != item["staged_hashes"]:
             raise RuntimeError(f"Staging changed: {name}")
@@ -1476,10 +1710,11 @@ def quarantine_inbox_cleanup(
                     source.name: source_sha256
                 }
 
-        if original_hashes != item["original_hashes"]:
-            raise RuntimeError(
-                f"Original download changed: {name}"
-            )
+        if original_hashes != item["original_hashes"] or (
+            not source_is_dir and item.get("source_sha256") is not None
+            and source_sha256 != item["source_sha256"]
+        ):
+            raise RuntimeError(f"Original download changed: {name}")
 
         quarantine = Path(tempfile.mkdtemp(
             prefix=".mixie-inbox-",
@@ -1492,6 +1727,8 @@ def quarantine_inbox_cleanup(
         recovery = {
             "version": 1,
             "kind": "inbox_cleanup",
+            "transaction_id": uuid.uuid4().hex,
+            "staging_provenance": provenance,
             "import_name": name,
             "source_name": source.name,
             "source_is_dir": source_is_dir,
@@ -1553,11 +1790,62 @@ def quarantine_inbox_cleanup(
     print("All quarantined files retained for recovery.")
     return moved
 
+def validate_cleanup_provenance(record):
+    """Validate an active journal's immutable source binding, including on resume.
+
+    Does not require a live stage or intact held copies: purge may be interrupted.
+    This checks provenance only, not completion receipts or permission to delete.
+    """
+    if not isinstance(record, dict) or not _safe_name(record.get("import_name")):
+        raise ValueError("Invalid cleanup provenance identity.")
+    provenance = staging_provenance(record["import_name"], verify_payload=False)
+    if provenance != record.get("staging_provenance"):
+        raise RuntimeError("Recovery provenance changed or is missing.")
+    if provenance is None:
+        return None
+    transaction = record.get("transaction_id")
+    if (not isinstance(transaction, str) or len(transaction) != 32
+            or any(character not in "0123456789abcdef" for character in transaction)):
+        raise ValueError("Invalid cleanup transaction identity.")
+    if provenance["payload_hashes"] != record.get("staged_hashes"):
+        raise RuntimeError("Recovery payload differs from committed provenance.")
+    if record.get("kind") == "inbox_cleanup":
+        if (record.get("source_name") != provenance["source_name"]
+                or type(record.get("source_is_dir")) is not bool
+                or record["source_is_dir"] != (provenance["source_kind"] == "directory")
+                or record.get("source_sha256") != provenance["source_sha256"]
+                or record.get("source_hashes") != provenance["payload_hashes"]):
+            raise RuntimeError("Inbox recovery source differs from committed provenance.")
+    elif (provenance["source_kind"] != "zip"
+            or record.get("archived_source") != provenance["source_name"]
+            or record.get("archived_source_hash") != provenance["source_sha256"]):
+        raise RuntimeError("Archived recovery source differs from committed provenance.")
+    return provenance
+
+
+def _retire_cleanup_transaction(folder, *, unpublished=False):
+    """Move metadata-only recovery evidence aside; never delete its journal."""
+    backup = _safe_directory(Path(script_folder) / constants.backup_folder_name)
+    root = _safe_directory(backup / ".cleanup-quarantine")
+    folder = _safe_directory(folder)
+    if folder.parent != root:
+        raise ValueError("Unsafe recovery retirement path.")
+    allowed = {"recovery.json.tmp"} if unpublished else {"recovery.json"}
+    for entry in folder.iterdir():
+        if entry.name not in allowed or entry.is_symlink() or not entry.is_file():
+            raise RuntimeError("Recovery retirement requires metadata-only transaction.")
+    retired = _safe_directory(backup / ".cleanup-restored", create=True)
+    _sync_directory(backup)
+    destination = retired / f"{folder.name}-{uuid.uuid4().hex}.restored"
+    _sync_directory(folder)
+    folder.rename(destination)
+    _sync_directory(root)
+    _sync_directory(retired)
+
+
 def restore_inbox_quarantine(approved=False):
     """Recover Inbox and staging files after interrupted cleanup."""
-    backup = (
-        Path(script_folder) / constants.backup_folder_name
-    ).resolve()
+    backup = _safe_directory(Path(script_folder) / constants.backup_folder_name, missing_ok=True)
     root = backup / ".cleanup-quarantine"
 
     if not root.exists():
@@ -1567,14 +1855,8 @@ def restore_inbox_quarantine(approved=False):
     if root.is_symlink() or not root.is_dir():
         raise ValueError("Unsafe quarantine directory.")
 
-    inbox = Path(inbox_folder)
-    staging = Path(staging_folder)
-
-    if (
-        inbox.is_symlink() or not inbox.is_dir()
-        or staging.is_symlink() or not staging.is_dir()
-    ):
-        raise ValueError("Unsafe Inbox or staging directory.")
+    inbox = _safe_directory(inbox_folder)
+    staging = _safe_directory(staging_folder)
 
     def sync_directory(path):
         fd = os.open(
@@ -1597,6 +1879,9 @@ def restore_inbox_quarantine(approved=False):
         record_path = folder / "recovery.json"
         held_stage = folder / "staging"
         held_source = folder / "original"
+        purge_state = folder / "purge-state.json"
+        if purge_state.exists() or purge_state.is_symlink():
+            raise RuntimeError("Purge already started; resume purge instead of restoring.")
 
         if record_path.is_symlink():
             raise ValueError("Unsafe recovery journal.")
@@ -1606,7 +1891,12 @@ def restore_inbox_quarantine(approved=False):
                 raise RuntimeError(
                     f"Quarantined files lack a recovery journal: {folder}"
                 )
+            if any(entry.name != "recovery.json.tmp" or entry.is_symlink() or not entry.is_file()
+                   for entry in folder.iterdir()):
+                raise RuntimeError("Unrecognized unpublished recovery files.")
             print(f"Unfinished empty journal: {folder.name}")
+            if approved:
+                _retire_cleanup_transaction(folder, unpublished=True)
             continue
 
         with record_path.open(encoding="utf-8") as file:
@@ -1636,6 +1926,7 @@ def restore_inbox_quarantine(approved=False):
         ):
             raise ValueError(f"Invalid recovery journal: {folder}")
 
+        validate_cleanup_provenance(record)
         source_is_dir = record["source_is_dir"]
         source = inbox / source_name
         stage = staging / name
@@ -1727,6 +2018,19 @@ def restore_inbox_quarantine(approved=False):
 
     for item in ready:
         name = item["name"]
+        validate_cleanup_provenance(item["record"])
+        staged_copy = item["held_stage"] if item["stage_held"] else item["stage"]
+        original_copy = item["held_source"] if item["source_held"] else item["source"]
+        if file_manifest(staged_copy) != item["record"]["staged_hashes"]:
+            raise RuntimeError(f"Staged recovery copy changed: {name}")
+        if original_copy.is_symlink():
+            raise ValueError("Unsafe original recovery copy.")
+        if item["record"]["source_is_dir"]:
+            valid = file_manifest(original_copy) == item["record"]["source_hashes"]
+        else:
+            valid = file_checksum(original_copy).hex() == item["record"]["source_sha256"]
+        if not valid:
+            raise RuntimeError(f"Original recovery copy changed: {name}")
 
         # Restore original download first.
         if item["source_held"]:
@@ -1773,17 +2077,8 @@ def restore_inbox_quarantine(approved=False):
                 f"Restored original verification failed: {name}"
             )
 
-        # Remove only the recovery journal, never music.
-        item["folder"].joinpath("recovery.json").unlink()
-        sync_directory(item["folder"])
-
-        try:
-            item["folder"].rmdir()
-        except OSError:
-            print(
-                f"Recovery folder retained for inspection: "
-                f"{item['folder']}"
-            )
+        validate_cleanup_provenance(item["record"])
+        _retire_cleanup_transaction(item["folder"])
 
         restored.append(name)
         print(f"Restored Inbox and staging: {name}")
@@ -1802,14 +2097,10 @@ def quarantine_archived_cleanup(
         print("Quarantine preview only. No files moved.")
         return ready
 
-    backup_root = (
-        Path(script_folder) / constants.backup_folder_name
-    ).resolve()
+    backup_root = _safe_directory(Path(script_folder) / constants.backup_folder_name)
 
-    quarantine_root = backup_root / ".cleanup-quarantine"
-    quarantine_root.mkdir(parents=True, exist_ok=True)
-
-    staged_root = Path(staging_folder).resolve()
+    quarantine_root = _safe_directory(backup_root / ".cleanup-quarantine", create=True)
+    staged_root = _safe_directory(staging_folder)
     moved = []
 
     for item in ready:
@@ -1823,8 +2114,7 @@ def quarantine_archived_cleanup(
             raise ValueError("Unsafe staged import.")
 
         # Recheck immediately before moving anything
-        if file_manifest(stage) != item["staged_hashes"]:
-            raise RuntimeError("Staged files changed.")
+        _check_candidate_provenance(item, file_manifest(stage))
 
         archived = zip_manifest(originals_zip)
 
@@ -1833,10 +2123,26 @@ def quarantine_archived_cleanup(
         ):
             raise RuntimeError("Original archive changed.")
 
-        if zip_manifest(library_zip) != file_manifest(
-            music_library_folder
-        ):
+        current_library = file_manifest(music_library_folder)
+        archived_library = zip_manifest(library_zip)
+        if archived_library != current_library:
             raise RuntimeError("Library snapshot changed.")
+        # Equality between two newly changed trees cannot replace the original
+        # per-album completion proof verified at the start of this operation.
+        library_root = _safe_directory(music_library_folder)
+        for key, album in item["albums"]:
+            receipt = completed.get(key)
+            if not isinstance(receipt, dict) or len(receipt) < len(album["tracks"]) + 1:
+                raise RuntimeError("Incomplete library receipt before quarantine.")
+            for destination, checksum in receipt.items():
+                path = Path(destination)
+                if (path.is_symlink() or not path.is_file()
+                        or not path.resolve().is_relative_to(library_root)):
+                    raise RuntimeError("Unsafe library receipt before quarantine.")
+                relative = path.resolve().relative_to(library_root).as_posix()
+                if (current_library.get(relative) != checksum
+                        or archived_library.get(relative) != checksum):
+                    raise RuntimeError("Library receipt changed before quarantine.")
 
         quarantine = Path(tempfile.mkdtemp(
             prefix=".mixie-archived-",
@@ -1847,6 +2153,8 @@ def quarantine_archived_cleanup(
 
         recovery = {
             "version": 1,
+            "transaction_id": uuid.uuid4().hex,
+            "staging_provenance": item.get("provenance"),
             "import_name": item["name"],
             "original_staging_path": str(stage),
             "staged_hashes": item["staged_hashes"],
@@ -1877,7 +2185,8 @@ def quarantine_archived_cleanup(
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
-
+        _sync_directory(quarantine_root)
+        _sync_directory(backup_root)
 
         try:
             stage.rename(held)
@@ -1912,11 +2221,9 @@ def quarantine_archived_cleanup(
 
 # Preview or restore staged imports from recoverable quarantine.
 def restore_archived_quarantine(approved=False):
-    backup_root = (
-        Path(script_folder) / constants.backup_folder_name
-    ).resolve()
+    backup_root = _safe_directory(Path(script_folder) / constants.backup_folder_name, missing_ok=True)
     quarantine_root = backup_root / ".cleanup-quarantine"
-    stage_root = Path(staging_folder).resolve()
+    stage_root = _safe_directory(staging_folder)
 
     if not quarantine_root.exists():
         print("No cleanup quarantine exists.")
@@ -1945,6 +2252,9 @@ def restore_archived_quarantine(approved=False):
 
         record_path = folder / "recovery.json"
         held = folder / "staging"
+        purge_state = folder / "purge-state.json"
+        if purge_state.exists() or purge_state.is_symlink():
+            raise RuntimeError("Purge already started; resume purge instead of restoring.")
 
         if record_path.is_symlink() or held.is_symlink():
             raise ValueError(f"Unsafe recovery record: {folder}")
@@ -1954,7 +2264,12 @@ def restore_archived_quarantine(approved=False):
                 raise RuntimeError(
                     f"Quarantined files lack recovery record: {folder}"
                 )
+            if any(entry.name != "recovery.json.tmp" or entry.is_symlink() or not entry.is_file()
+                   for entry in folder.iterdir()):
+                raise RuntimeError("Unrecognized unpublished recovery files.")
             print(f"Unfinished empty quarantine: {folder.name}")
+            if approved:
+                _retire_cleanup_transaction(folder, unpublished=True)
             continue
 
         with record_path.open(encoding="utf-8") as source:
@@ -1965,14 +2280,13 @@ def restore_archived_quarantine(approved=False):
 
         if (
             record.get("version") != 1
-            or not isinstance(name, str)
-            or name in ("", ".", "..")
-            or Path(name).name != name
+            or not _safe_name(name)
             or not isinstance(hashes, dict)
             or not hashes
         ):
             raise ValueError(f"Invalid recovery record: {folder}")
 
+        validate_cleanup_provenance(record)
         stage = stage_root / name
 
         if Path(record.get("original_staging_path", "")) != stage:
@@ -1989,7 +2303,7 @@ def restore_archived_quarantine(approved=False):
                     f"Recovery checksum mismatch: {name}"
                 )
 
-            ready.append((name, held, stage, hashes))
+            ready.append((name, held, stage, hashes, record))
             print(f"Recoverable: {name}")
 
         elif stage.is_dir() and not stage.is_symlink():
@@ -1997,6 +2311,7 @@ def restore_archived_quarantine(approved=False):
                 raise RuntimeError(
                     f"Existing staging differs: {name}"
                 )
+            ready.append((name, held, stage, hashes, record))
             print(f"Already in staging: {name}")
 
         else:
@@ -2011,23 +2326,24 @@ def restore_archived_quarantine(approved=False):
 
     restored = []
 
-    for name, held, stage, hashes in ready:
-        if stage.exists() or stage.is_symlink():
-            raise RuntimeError(
-                f"Recovery destination became occupied: {stage}"
-            )
-
-        if file_manifest(held) != hashes:
-            raise RuntimeError(f"Quarantine changed: {name}")
-
-        held.rename(stage)
-
+    for name, held, stage, hashes, record in ready:
+        validate_cleanup_provenance(record)
+        if held.exists():
+            if stage.exists() or stage.is_symlink():
+                raise RuntimeError(f"Recovery destination became occupied: {stage}")
+            if file_manifest(held) != hashes:
+                raise RuntimeError(f"Quarantine changed: {name}")
+            held.rename(stage)
+            _sync_directory(stage_root)
+            _sync_directory(held.parent)
         if file_manifest(stage) != hashes:
             raise RuntimeError(
                 f"Post-restore verification failed: {name}. "
                 "Files retained in staging for inspection."
             )
 
+        validate_cleanup_provenance(record)
+        _retire_cleanup_transaction(held.parent)
         restored.append(name)
         print(f"Restored to staging: {name}")
 

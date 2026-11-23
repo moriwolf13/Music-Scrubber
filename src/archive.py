@@ -11,29 +11,29 @@ import os
 backup_folder = tag.script_folder / constants.backup_folder_name
 
 def file_hash(path):
-    checksum = hashlib.sha256()
-    with open(path, "rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            checksum.update(chunk)
-    return checksum.hexdigest()
+    import sort
+    return sort.file_checksum(path).hex()
 
 def snapshot_files(folder):
-    files = {}
-    for path in sorted(folder.rglob("*")):
-        if path.is_symlink():
-            raise ValueError(f"Symbolic link in import: {path}")
-        if path.is_file():
-            relative = path.relative_to(folder).as_posix()
-            files[relative] = file_hash(path)
-    return files
+    import sort
+    return sort.file_manifest(folder)
+
+
+def _backup_root():
+    import sort
+    return sort._safe_directory(backup_folder, create=True)
 
 # Preserve an untouched, verified copy of a staged import
 def backup_staged_import(album):
-    staging = tag.staging_folder.resolve()
-    tracks = [
-        Path(track["path"]).resolve()
-        for track in album["tracks"]
-    ]
+    import sort
+    staging = sort._safe_directory(tag.staging_folder)
+    tracks = []
+    for track in album["tracks"]:
+        path = Path(track["path"])
+        sort._safe_directory(path.parent)
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("Invalid staged track.")
+        tracks.append(path.resolve())
 
     # All tracks must belong to the same staged import
     import_names = set()
@@ -51,10 +51,22 @@ def backup_staged_import(album):
     originals = snapshot_files(source)
     if not originals:
         raise ValueError("No files to back up.")
+    provenance = sort.staging_provenance(import_name, verify_payload=False)
+    if provenance is not None and provenance["payload_hashes"] != originals:
+        raise RuntimeError("Staged import differs from committed provenance.")
     manifest = {
         "import_name": import_name,
         "files": originals
     }
+    if provenance is not None:
+        manifest["staging_provenance"] = provenance
+
+    def verify_source():
+        if snapshot_files(source) != originals:
+            raise RuntimeError("Staged source changed during backup.")
+        if sort.staging_provenance(import_name, verify_payload=False) != provenance:
+            raise RuntimeError("Staging provenance changed during backup.")
+
     encoded = json.dumps(
         manifest, sort_keys=True
     ).encode("utf-8")
@@ -62,32 +74,49 @@ def backup_staged_import(album):
     import_id = hashlib.sha256(
         import_name.encode("utf-8")
     ).hexdigest()[:12]
-    backup_folder.mkdir(parents=True, exist_ok=True)
-    destination = backup_folder / f"{import_id}-{snapshot_id}"
+    backup = _backup_root()
+    destination = backup / f"{import_id}-{snapshot_id}"
 
-    # Reuse only an existing backup that passes verification
-    if destination.exists():
-        saved = snapshot_files(destination / "original")
-        if saved != originals:
+    # Payload equality alone does not verify the recovery/provenance manifest.
+    if os.path.lexists(destination):
+        if destination.is_symlink() or not destination.is_dir():
+            raise ValueError("Unsafe existing backup.")
+        record = destination / "manifest.json"
+        if record.is_symlink() or not record.is_file():
+            raise ValueError("Existing backup manifest is missing or unsafe.")
+        if {path.name for path in destination.iterdir()} != {"original", "manifest.json"}:
+            raise ValueError("Unexpected files in existing backup.")
+        try:
+            saved_manifest = json.loads(record.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise RuntimeError("Existing backup manifest is invalid.") from error
+        if saved_manifest != manifest or snapshot_files(destination / "original") != originals:
             raise RuntimeError("Existing backup failed verification.")
+        verify_source()
         print(f"Verified existing backup: {destination.name}")
         return destination
     temporary = Path(tempfile.mkdtemp(
         prefix=".mixie-backup-",
-        dir=backup_folder
+        dir=backup
     ))
     try:
         shutil.copytree(source, temporary / "original")
         saved = snapshot_files(temporary / "original")
         if saved != originals:
             raise RuntimeError("Backup checksum verification failed.")
-        (temporary / "manifest.json").write_text(
-            json.dumps(manifest, indent=2),
-            encoding="utf-8"
-        )
+        verify_source()
+        sort._sync_payload(temporary / "original", originals)
+        with (temporary / "manifest.json").open("x", encoding="utf-8") as stream:
+            json.dump(manifest, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        sort._sync_directory(temporary)
+        verify_source()
         temporary.rename(destination)
+        sort._sync_directory(backup)
     except Exception:
-        shutil.rmtree(temporary)
+        if temporary.exists():
+            shutil.rmtree(temporary)
         raise
 
     print(f"Backup created and verified: {destination.name}")
@@ -95,64 +124,35 @@ def backup_staged_import(album):
     return destination
 
 def create_verified_zip(source_folder, label):
-    source = Path(source_folder).resolve()
-
-    if not source.is_dir():
-        raise FileNotFoundError(source)
+    import sort
+    source = sort._safe_directory(source_folder)
 
     if not label.isidentifier():
         raise ValueError("Invalid archive label.")
 
-    files = {}
-
-    for path in source.rglob("*"):
-        if path.is_symlink():
-            raise ValueError(f"Symlink in source: {path}")
-
-        if path.is_file():
-            name = path.relative_to(source).as_posix()
-            files[name] = (path, file_hash(path))
-
-    if not files:
+    manifest = snapshot_files(source)
+    if not manifest:
         raise ValueError("Nothing to archive.")
-
-    manifest = {
-        name: checksum
-        for name, (_, checksum) in files.items()
-    }
+    files = {name: (source / name, checksum) for name, checksum in manifest.items()}
 
     archive_id = hashlib.sha256(
         json.dumps(manifest, sort_keys=True).encode("utf-8")
     ).hexdigest()[:16]
 
-    backup_folder.mkdir(parents=True, exist_ok=True)
-    destination = backup_folder / f"{label}-{archive_id}.zip"
+    backup = _backup_root()
+    destination = backup / f"{label}-{archive_id}.zip"
 
     if destination.resolve().is_relative_to(source):
         raise ValueError("Archive cannot be inside its source.")
 
     def verify(zip_path):
-        with zipfile.ZipFile(zip_path) as saved:
-            names = saved.namelist()
-            if len(names) != len(files) or set(names) != set(files):
-                raise RuntimeError("Archive contents are incomplete.")
-            for name in names:
-                digest = hashlib.sha256()
-                with saved.open(name) as entry:
-                    for chunk in iter(
-                        lambda: entry.read(1024 * 1024), b""
-                    ):
-                        digest.update(chunk)
-                if digest.hexdigest() != files[name][1]:
-                    raise RuntimeError(
-                        f"Archive verification failed: {name}"
-                    )
-        for path, expected in files.values():
-            if file_hash(path) != expected:
-                raise RuntimeError(
-                    f"Source changed during archiving: {path}"
-                )
-    if destination.exists():
+        if sort.zip_manifest(zip_path) != manifest:
+            raise RuntimeError("Archive contents or checksums are incomplete.")
+        # Re-enumeration catches additions as well as changed or removed files.
+        if snapshot_files(source) != manifest:
+            raise RuntimeError("Source inventory changed during archiving.")
+
+    if os.path.lexists(destination):
         if destination.is_symlink() or not destination.is_file():
             raise ValueError("Unsafe existing archive.")
         verify(destination)
@@ -161,7 +161,7 @@ def create_verified_zip(source_folder, label):
     descriptor, temporary = tempfile.mkstemp(
         prefix=".mixie-zip-",
         suffix=".tmp",
-        dir=backup_folder
+        dir=backup
     )
     os.close(descriptor)
     try:
@@ -175,7 +175,10 @@ def create_verified_zip(source_folder, label):
         verify(temporary)
         with open(temporary, "rb") as completed:
             os.fsync(completed.fileno())
+        if snapshot_files(source) != manifest:
+            raise RuntimeError("Source inventory changed before archive publication.")
         os.replace(temporary, destination)
+        sort._sync_directory(backup)
     finally:
         Path(temporary).unlink(missing_ok=True)
     print(
@@ -188,9 +191,9 @@ def update_original_downloads_archive():
     """Maintain a verified cumulative archive of untouched downloads."""
     import sort
 
-    inbox = Path(sort.inbox_folder)
-    backup_folder.mkdir(parents=True, exist_ok=True)
-    destination = backup_folder / "OriginalDownloads-Bulk.zip"
+    inbox = sort._safe_directory(sort.inbox_folder)
+    backup = _backup_root()
+    destination = backup / "OriginalDownloads-Bulk.zip"
 
     current = sort.file_manifest(inbox)
 
@@ -199,10 +202,8 @@ def update_original_downloads_archive():
     if destination.exists() and not destination.is_file():
         raise ValueError("Invalid bulk archive.")
 
-    previous = (
-        sort.zip_manifest(destination)
-        if destination.exists() else {}
-    )
+    previous_digest = file_hash(destination) if destination.exists() else None
+    previous = sort.zip_manifest(destination) if destination.exists() else {}
 
     if not current and not previous:
         raise ValueError("No downloads to archive.")
@@ -212,19 +213,31 @@ def update_original_downloads_archive():
         if name in previous and previous[name] != checksum:
             raise ValueError(f"Original download changed: {name}")
 
+    # A still-present directory cannot silently become a different historical
+    # tree: its retained prefix would no longer describe this original import.
+    for source in inbox.iterdir():
+        if source.is_dir() and not source.is_symlink():
+            prefix = source.name + "/"
+            if any(name.startswith(prefix) and name not in current for name in previous):
+                raise ValueError(f"Original download directory changed: {source.name}")
+
     combined = {**previous, **current}
 
-    if len({name.casefold() for name in combined}) != len(combined):
-        raise ValueError("Case-insensitive archive filename conflict.")
+    # This archive is a case-sensitive inventory, not an extraction plan.
+    # Exact Linux names must survive independently; changed exact names still fail.
 
     if destination.exists() and combined == previous:
+        if sort.file_manifest(inbox) != current:
+            raise RuntimeError("Inbox changed during archive verification.")
+        if file_hash(destination) != previous_digest:
+            raise RuntimeError("Previous archive changed during verification.")
         print(f"Cumulative archive verified: {len(previous)} files")
         return destination
 
     descriptor, temporary = tempfile.mkstemp(
         prefix=".mixie-bulk-",
         suffix=".tmp",
-        dir=backup_folder
+        dir=backup
     )
     os.close(descriptor)
 
@@ -265,7 +278,10 @@ def update_original_downloads_archive():
         if sort.file_manifest(inbox) != current:
             raise RuntimeError("Inbox changed during archiving.")
 
-        if previous and sort.zip_manifest(destination) != previous:
+        if previous_digest is not None and (
+            file_hash(destination) != previous_digest
+            or sort.zip_manifest(destination) != previous
+        ):
             raise RuntimeError("Previous archive changed during update.")
 
         with open(temporary, "rb") as saved:
@@ -273,6 +289,7 @@ def update_original_downloads_archive():
 
         # Publish only after complete verification
         os.replace(temporary, destination)
+        sort._sync_directory(backup)
 
     finally:
         Path(temporary).unlink(missing_ok=True)
